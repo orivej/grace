@@ -28,9 +28,10 @@ const (
 
 var verbose = flag.Bool("gracehttp.log", false, "Enable logging.")
 
-// Serve either serves on the socket in FD 3 if started with systemd-compatible
-// protocol, or:
-// - starts /proc/self/exe in a subprocess with systemd-compatible protocol
+// Serve either serves on the previously opened sockets if started with
+// systemd-compatible protocol, or:
+// - opens sockets and starts /proc/self/exe in a subprocess with
+//   systemd-compatible protocol
 // - gracefully terminates subprocess on SIGTERM
 // - gracefully restarts subprocess on SIGUSR2
 func Serve(servers ...*http.Server) error {
@@ -108,6 +109,7 @@ func serve(listeners []net.Listener, servers []*http.Server) error {
 			errs[i] = hdServers[i].Stop()
 		}(i)
 	}
+	wg.Wait()
 
 	for _, err := range errs {
 		if err != nil {
