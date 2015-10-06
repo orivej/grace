@@ -1,7 +1,11 @@
 package gracehttp
 
 import (
+	"bytes"
 	"crypto/tls"
+	"flag"
+	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -22,6 +26,8 @@ const (
 	sdReady   = "READY=1"
 )
 
+var verbose = flag.Bool("gracehttp.log", false, "Enable logging.")
+
 // Serve either serves on the socket in FD 3 if started with systemd-compatible
 // protocol, or:
 // - starts /proc/self/exe in a subprocess with systemd-compatible protocol
@@ -30,34 +36,49 @@ const (
 func Serve(servers ...*http.Server) error {
 	// Simplify LISTEN_PID protocol because it is harder to set PID between
 	// fork and exec in Golang.
-	if os.Getenv(listenPID) == "0" {
+	pid := os.Getenv(listenPID)
+	initActivated := len(pid) != 0 && pid != "0"
+	if pid == "0" {
 		if err := os.Setenv(listenPID, strconv.Itoa(os.Getpid())); err != nil {
 			return err
 		}
 	}
 
 	listeners, _ := activation.Listeners(true) // ignore error: always nil
-	if len(listeners) != 0 {
+	didInherit := len(listeners) != 0
+
+	if *verbose {
+		if didInherit {
+			if initActivated {
+				log.Printf("Listening on init activated %s", pprintAddr(servers))
+			} else {
+				const msg = "Graceful handoff of %s with new pid %d"
+				log.Printf(msg, pprintAddr(servers), os.Getpid())
+			}
+		} else {
+			const msg = "Serving %s with pid %d"
+			log.Printf(msg, pprintAddr(servers), os.Getpid())
+		}
+	}
+
+	if didInherit {
 		// Serve.
 		return serve(listeners, servers)
 	}
 
 	// Listen and fork&exec to serve.
 	fds := make([]*os.File, len(servers))
-	for i, s := range servers {
-		l, err := net.Listen("tcp", s.Addr)
+	for i, srv := range servers {
+		l, err := net.Listen("tcp", srv.Addr)
 		if err != nil {
 			return err
-		}
-
-		if s.TLSConfig != nil {
-			l = tls.NewListener(l, s.TLSConfig)
 		}
 
 		fds[i], err = l.(*net.TCPListener).File()
 		if err != nil {
 			return err
 		}
+		defer fds[i].Close() // ignore error
 	}
 
 	return runServer(fds)
@@ -66,6 +87,9 @@ func Serve(servers ...*http.Server) error {
 func serve(listeners []net.Listener, servers []*http.Server) error {
 	hdServers := make([]httpdown.Server, len(listeners))
 	for i, l := range listeners {
+		if servers[i].TLSConfig != nil {
+			l = tls.NewListener(l, servers[i].TLSConfig)
+		}
 		hdServers[i] = httpdown.HTTP{}.Serve(servers[i], l)
 	}
 	_ = daemon.SdNotify(sdReady) // ignore error
@@ -126,6 +150,9 @@ func startProcess(fds []*os.File) (exec.Cmd, error) {
 	cmd := exec.Cmd{
 		Path:       "/proc/self/exe",
 		Args:       os.Args,
+		Stdin:      os.Stdin,
+		Stdout:     os.Stdout,
+		Stderr:     os.Stderr,
 		ExtraFiles: fds,
 	}
 	return cmd, cmd.Start()
@@ -138,8 +165,21 @@ func endProcess(p *os.Process) error {
 	if err := p.Signal(syscall.SIGTERM); err != nil {
 		return err
 	}
-	if _, err := p.Wait(); err != nil {
-		return err
+	_, err := p.Wait()
+	if *verbose {
+		log.Printf("Exiting pid %d.", p.Pid)
 	}
-	return nil
+	return err
+}
+
+// Used for pretty printing addresses.
+func pprintAddr(servers []*http.Server) []byte {
+	var out bytes.Buffer
+	for i, srv := range servers {
+		if i != 0 {
+			fmt.Fprint(&out, ", ")
+		}
+		fmt.Fprint(&out, srv.Addr)
+	}
+	return out.Bytes()
 }
