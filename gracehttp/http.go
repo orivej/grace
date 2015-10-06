@@ -1,186 +1,145 @@
-// Package gracehttp provides easy to use graceful restart
-// functionality for HTTP server.
 package gracehttp
 
 import (
-	"bytes"
 	"crypto/tls"
-	"flag"
-	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 
-	"github.com/facebookgo/grace/gracenet"
+	"github.com/coreos/go-systemd/activation"
+	"github.com/coreos/go-systemd/daemon"
 	"github.com/facebookgo/httpdown"
 )
 
-var (
-	verbose    = flag.Bool("gracehttp.log", true, "Enable logging.")
-	didInherit = os.Getenv("LISTEN_FDS") != ""
-	ppid       = os.Getppid()
+const (
+	listenPID = "LISTEN_PID"
+	listenFDs = "LISTEN_FDS"
+	sdReady   = "READY=1"
 )
 
-// An app contains one or more servers and associated configuration.
-type app struct {
-	servers   []*http.Server
-	http      *httpdown.HTTP
-	net       *gracenet.Net
-	listeners []net.Listener
-	sds       []httpdown.Server
-	errors    chan error
-}
-
-func newApp(servers []*http.Server) *app {
-	return &app{
-		servers:   servers,
-		http:      &httpdown.HTTP{},
-		net:       &gracenet.Net{},
-		listeners: make([]net.Listener, 0, len(servers)),
-		sds:       make([]httpdown.Server, 0, len(servers)),
-
-		// 2x num servers for possible Close or Stop errors + 1 for possible
-		// StartProcess error.
-		errors: make(chan error, 1+(len(servers)*2)),
+// Serve either serves on the socket in FD 3 if started with systemd-compatible
+// protocol, or:
+// - starts /proc/self/exe in a subprocess with systemd-compatible protocol
+// - gracefully terminates subprocess on SIGTERM
+// - gracefully restarts subprocess on SIGUSR2
+func Serve(servers ...*http.Server) error {
+	// Simplify LISTEN_PID protocol because it is harder to set PID between
+	// fork and exec in Golang.
+	if os.Getenv(listenPID) == "0" {
+		if err := os.Setenv(listenPID, strconv.Itoa(os.Getpid())); err != nil {
+			return err
+		}
 	}
-}
 
-func (a *app) listen() error {
-	for _, s := range a.servers {
-		// TODO: default addresses
-		l, err := a.net.Listen("tcp", s.Addr)
+	listeners, _ := activation.Listeners(true) // ignore error: always nil
+	if len(listeners) != 0 {
+		// Serve.
+		return serve(listeners, servers)
+	}
+
+	// Listen and fork&exec to serve.
+	fds := make([]*os.File, len(servers))
+	for i, s := range servers {
+		l, err := net.Listen("tcp", s.Addr)
 		if err != nil {
 			return err
 		}
+
 		if s.TLSConfig != nil {
 			l = tls.NewListener(l, s.TLSConfig)
 		}
-		a.listeners = append(a.listeners, l)
+
+		fds[i], err = l.(*net.TCPListener).File()
+		if err != nil {
+			return err
+		}
+	}
+
+	return runServer(fds)
+}
+
+func serve(listeners []net.Listener, servers []*http.Server) error {
+	hdServers := make([]httpdown.Server, len(listeners))
+	for i, l := range listeners {
+		hdServers[i] = httpdown.HTTP{}.Serve(servers[i], l)
+	}
+	_ = daemon.SdNotify(sdReady) // ignore error
+
+	ch := make(chan os.Signal)
+	signal.Notify(ch, syscall.SIGTERM)
+	<-ch
+	signal.Stop(ch)
+
+	errs := make([]error, len(listeners))
+	wg := sync.WaitGroup{}
+	for i := range hdServers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = hdServers[i].Stop()
+		}(i)
+	}
+
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-func (a *app) serve() {
-	for i, s := range a.servers {
-		a.sds = append(a.sds, a.http.Serve(s, a.listeners[i]))
+func runServer(fds []*os.File) error {
+	if err := os.Setenv(listenPID, "0"); err != nil {
+		return err
 	}
-}
-
-func (a *app) wait() {
-	var wg sync.WaitGroup
-	wg.Add(len(a.sds) * 2) // Wait & Stop
-	go a.signalHandler(&wg)
-	for _, s := range a.sds {
-		go func(s httpdown.Server) {
-			defer wg.Done()
-			if err := s.Wait(); err != nil {
-				a.errors <- err
-			}
-		}(s)
+	if err := os.Setenv(listenFDs, strconv.Itoa(len(fds))); err != nil {
+		return err
 	}
-	wg.Wait()
-}
 
-func (a *app) term(wg *sync.WaitGroup) {
-	for _, s := range a.sds {
-		go func(s httpdown.Server) {
-			defer wg.Done()
-			if err := s.Stop(); err != nil {
-				a.errors <- err
-			}
-		}(s)
+	cmd, err := startProcess(fds)
+	if err != nil {
+		return err
 	}
-}
 
-func (a *app) signalHandler(wg *sync.WaitGroup) {
-	ch := make(chan os.Signal, 10)
+	ch := make(chan os.Signal)
 	signal.Notify(ch, syscall.SIGTERM, syscall.SIGUSR2)
 	for {
 		sig := <-ch
 		switch sig {
 		case syscall.SIGTERM:
-			// this ensures a subsequent TERM will trigger standard go behaviour of
-			// terminating.
-			signal.Stop(ch)
-			a.term(wg)
-			return
+			return endProcess(cmd.Process)
 		case syscall.SIGUSR2:
-			// we only return here if there's an error, otherwise the new process
-			// will send us a TERM when it's ready to trigger the actual shutdown.
-			if _, err := a.net.StartProcess(); err != nil {
-				a.errors <- err
+			go endProcess(cmd.Process) // ignore error
+			if cmd, err = startProcess(fds); err != nil {
+				return err
 			}
 		}
 	}
 }
 
-// Serve will serve the given http.Servers and will monitor for signals
-// allowing for graceful termination (SIGTERM) or restart (SIGUSR2).
-func Serve(servers ...*http.Server) error {
-	a := newApp(servers)
-
-	// Acquire Listeners
-	if err := a.listen(); err != nil {
-		return err
+func startProcess(fds []*os.File) (exec.Cmd, error) {
+	cmd := exec.Cmd{
+		Path:       "/proc/self/exe",
+		Args:       os.Args,
+		ExtraFiles: fds,
 	}
+	return cmd, cmd.Start()
+}
 
-	// Some useful logging.
-	if *verbose {
-		if didInherit {
-			if ppid == 1 {
-				log.Printf("Listening on init activated %s", pprintAddr(a.listeners))
-			} else {
-				const msg = "Graceful handoff of %s with new pid %d and old pid %d"
-				log.Printf(msg, pprintAddr(a.listeners), os.Getpid(), ppid)
-			}
-		} else {
-			const msg = "Serving %s with pid %d"
-			log.Printf(msg, pprintAddr(a.listeners), os.Getpid())
-		}
-	}
-
-	// Start serving.
-	a.serve()
-
-	// Close the parent if we inherited and it wasn't init that started us.
-	if didInherit && ppid != 1 {
-		if err := syscall.Kill(ppid, syscall.SIGTERM); err != nil {
-			return fmt.Errorf("failed to close parent: %s", err)
-		}
-	}
-
-	waitdone := make(chan struct{})
-	go func() {
-		defer close(waitdone)
-		a.wait()
-	}()
-
-	select {
-	case err := <-a.errors:
-		if err == nil {
-			panic("unexpected nil error")
-		}
-		return err
-	case <-waitdone:
-		if *verbose {
-			log.Printf("Exiting pid %d.", os.Getpid())
-		}
+func endProcess(p *os.Process) error {
+	if p == nil {
 		return nil
 	}
-}
-
-// Used for pretty printing addresses.
-func pprintAddr(listeners []net.Listener) []byte {
-	var out bytes.Buffer
-	for i, l := range listeners {
-		if i != 0 {
-			fmt.Fprint(&out, ", ")
-		}
-		fmt.Fprint(&out, l.Addr())
+	if err := p.Signal(syscall.SIGTERM); err != nil {
+		return err
 	}
-	return out.Bytes()
+	if _, err := p.Wait(); err != nil {
+		return err
+	}
+	return nil
 }
