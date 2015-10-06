@@ -33,8 +33,7 @@ type harness struct {
 	T                 *testing.T     // The test instance.
 	httpAddr          string         // The address for the http server.
 	httpsAddr         string         // The address for the https server.
-	Process           []*os.Process  // The server commands, oldest to newest.
-	ProcessMutex      sync.Mutex     // The mutex to guard Process manipulation.
+	Process           *os.Process    // The server launcher.
 	RequestWaitGroup  sync.WaitGroup // The wait group for the HTTP requests.
 	newProcess        chan bool      // A bool is sent on start/restart.
 	requestCount      int
@@ -86,13 +85,6 @@ func (h *harness) Start() {
 			if res.Error != "" {
 				println(fmt.Sprintf("Got error from process: %v", res))
 			}
-			process, err := os.FindProcess(res.Pid)
-			if err != nil {
-				println(fmt.Sprintf("Could not find process with pid: %d", res.Pid))
-			}
-			h.ProcessMutex.Lock()
-			h.Process = append(h.Process, process)
-			h.ProcessMutex.Unlock()
 			h.newProcess <- true
 		}
 	}()
@@ -100,12 +92,13 @@ func (h *harness) Start() {
 	if err != nil {
 		h.T.Fatalf("Failed to start command: %s", err)
 	}
+	h.Process = cmd.Process
 	<-h.newProcess
 }
 
 // Restart the most recent server.
 func (h *harness) Restart() {
-	err := h.MostRecentProcess().Signal(syscall.SIGUSR2)
+	err := h.Process.Signal(syscall.SIGUSR2)
 	if err != nil {
 		h.T.Fatalf("Failed to send SIGUSR2 and restart process: %s", err)
 	}
@@ -114,21 +107,10 @@ func (h *harness) Restart() {
 
 // Graceful termination of the most recent server.
 func (h *harness) Stop() {
-	err := h.MostRecentProcess().Signal(syscall.SIGTERM)
+	err := h.Process.Signal(syscall.SIGTERM)
 	if err != nil {
 		h.T.Fatalf("Failed to send SIGTERM and stop process: %s", err)
 	}
-}
-
-// Returns the most recent server process.
-func (h *harness) MostRecentProcess() *os.Process {
-	h.ProcessMutex.Lock()
-	defer h.ProcessMutex.Unlock()
-	l := len(h.Process)
-	if l == 0 {
-		h.T.Fatalf("Most recent command requested before command was created.")
-	}
-	return h.Process[l-1]
 }
 
 // Get the global request count and increment it.
@@ -170,21 +152,12 @@ func (h *harness) SendOne(dialgroup *sync.WaitGroup, url string, pid int) {
 	if err != nil {
 		h.T.Fatalf("Failed to ready decode json response body pid=%d: %s", pid, err)
 	}
-	if pid != res.Pid {
-		for _, old := range h.Process[0 : len(h.Process)-1] {
-			if res.Pid == old.Pid {
-				h.T.Logf("Found old pid %d, ignoring the discrepancy", res.Pid)
-				return
-			}
-		}
-		h.T.Fatalf("Didn't get expected pid %d instead got %d", pid, res.Pid)
-	}
 	debug("Done %02d pid=%d url=%s", count, pid, url)
 }
 
 // Send test HTTP request.
 func (h *harness) SendRequest() {
-	pid := h.MostRecentProcess().Pid
+	pid := h.Process.Pid
 	httpFastURL := fmt.Sprintf("http://%s/sleep/?duration=0", h.httpAddr)
 	httpSlowURL := fmt.Sprintf("http://%s/sleep/?duration=2s", h.httpAddr)
 	httpsFastURL := fmt.Sprintf("https://%s/sleep/?duration=0", h.httpsAddr)
