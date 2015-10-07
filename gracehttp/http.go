@@ -28,12 +28,10 @@ const (
 
 var verbose = flag.Bool("gracehttp.log", false, "Enable logging.")
 
-// Serve either serves on the previously opened sockets if started with
-// systemd-compatible protocol, or:
-// - opens sockets and starts /proc/self/exe in a subprocess with
-//   systemd-compatible protocol
-// - gracefully terminates subprocess on SIGTERM
-// - gracefully restarts subprocess on SIGUSR2
+// Serve either serves on the previously opened sockets if started with systemd-compatible protocol, or:
+//  - opens sockets and starts /proc/self/exe in a subprocess with systemd-compatible protocol
+//  - gracefully terminates subprocess on SIGTERM
+//  - gracefully restarts subprocess on SIGUSR2
 func Serve(servers ...*http.Server) error {
 	// Simplify LISTEN_PID protocol because it is harder to set PID between
 	// fork and exec in Golang.
