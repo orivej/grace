@@ -146,16 +146,21 @@ func runServer(fds []*os.File) error {
 	}
 }
 
-func startProcess(fds []*os.File) (exec.Cmd, error) {
+func startProcess(fds []*os.File) (*exec.Cmd, error) {
+	path, err := exec.LookPath(os.Args[0])
+	if err != nil {
+		return nil, err
+	}
+
 	cmd := exec.Cmd{
-		Path:       "/proc/self/exe",
+		Path:       path,
 		Args:       os.Args,
 		Stdin:      os.Stdin,
 		Stdout:     os.Stdout,
 		Stderr:     os.Stderr,
 		ExtraFiles: fds,
 	}
-	return cmd, cmd.Start()
+	return &cmd, cmd.Start()
 }
 
 func endProcess(p *os.Process) error {
